@@ -1,0 +1,43 @@
+name: Multirate benchmark notebooks
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Branch holding the notebooks to execute
+        default: multirate-benchmarks-ci
+        type: string
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    strategy:
+      fail-fast: false
+      matrix:
+        notebook: [burgers_fdm_wpd, ks_fdm_wpd, allen_cahn_fdm_wpd]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+      - uses: julia-actions/setup-julia@v2
+        with:
+          version: '1.10'
+      - uses: julia-actions/cache@v2
+      - name: Instantiate benchmark environment
+        run: julia --project=benchmarks/SimpleHandwrittenPDE -e 'using Pkg; Pkg.instantiate()'
+      - name: Execute notebook
+        env:
+          GKSwstype: "100"
+        run: >
+          julia --project=benchmarks/SimpleHandwrittenPDE
+          .github/scripts/runjmd.jl
+          benchmarks/SimpleHandwrittenPDE/${{ matrix.notebook }}.jmd
+          figs_out
+      - name: Upload figures and logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: figs-${{ matrix.notebook }}
+          path: figs_out
+          if-no-files-found: warn
