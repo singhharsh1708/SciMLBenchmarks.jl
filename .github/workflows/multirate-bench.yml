@@ -24,6 +24,10 @@ jobs:
         with:
           version: '1.10'
       - uses: julia-actions/cache@v2
+      - name: Fetch runner script from master
+        run: >
+          curl -fsSL -o /tmp/runjmd.jl
+          https://raw.githubusercontent.com/${{ github.repository }}/master/.github/scripts/runjmd.jl
       - name: Instantiate benchmark environment
         run: julia --project=benchmarks/SimpleHandwrittenPDE -e 'using Pkg; Pkg.instantiate()'
       - name: Execute notebook
@@ -31,7 +35,7 @@ jobs:
           GKSwstype: "100"
         run: >
           julia --project=benchmarks/SimpleHandwrittenPDE
-          .github/scripts/runjmd.jl
+          /tmp/runjmd.jl
           benchmarks/SimpleHandwrittenPDE/${{ matrix.notebook }}.jmd
           figs_out
       - name: Upload figures and logs
