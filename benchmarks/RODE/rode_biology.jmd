@@ -1,0 +1,442 @@
+---
+title: RODE Solvers on Biological Models
+author: Harsh Singh
+---
+
+Chapter 15 of Han and Kloeden, *Random Ordinary Differential Equations and Their Numerical
+Solution* ([Springer 2017](https://doi.org/10.1007/978-981-10-6265-0)), tests RODE schemes on
+four models from the life sciences. This page solves three of them with three RODE solvers of
+StochasticDiffEq.jl, `RandomEM`, `RandomHeun` and `RandomTaylor15`, and for contrast with the
+classical `Euler`, `Tsit5` and `Vern9` on the same paths. The fourth model, the sea shell
+pattern model of Section 15.4, is a system of partial differential equations and is omitted.
+
+The noise is of a different kind in each model: an Ornstein-Uhlenbeck process inside a cosine,
+two compound Poisson processes added to the activation terms, and a Wiener process inside a
+bounded rational function. For each model the page measures the strong convergence of every
+solver, and at the end the error against time for one path.
+
+```julia
+using StochasticDiffEq, DiffEqNoiseProcess, OrdinaryDiffEqLowOrderRK, OrdinaryDiffEqTsit5,
+      OrdinaryDiffEqVerner, BenchmarkTools, Plots, Random, Statistics, Printf
+gr()
+
+const SEED = 20261004
+const FINE = 2^20
+const NSAVE = 2^14
+const STEPS = [32, 64, 128, 256, 512, 1024, 2048]
+const WP_STEPS = [64, 256, 1024, 4096, 16384]
+const PATHS = 16
+```
+
+## Noise paths and reference solution
+
+Each noise path is generated once on a grid of $2^{20}$ cells from the exact transition of its
+process, so the stored values are samples of the process itself: Gaussian increments for the
+Wiener process, the Gaussian transition of the Ornstein-Uhlenbeck process with the variance
+derived in Section 14.3 of the book, and exponential waiting times with uniform jump sizes for
+the compound Poisson process of Section 14.5.
+
+Every solver sees a stored path as the piecewise linear function through its points. The RODE
+solvers read it from a `NoiseGrid`, which interpolates linearly, and the ODE solvers call the
+interpolant `make_W` from their right-hand side. A jump of a compound Poisson process therefore
+appears as a ramp one cell wide.
+
+```julia
+function ou_path(rng, tend; th1 = 0.0, th2 = 4.0, th3 = 0.1)
+    decay = exp(-th2 * tend / FINE); sd = th3 * sqrt((1 - decay^2) / (2 * th2))
+    Y = zeros(FINE + 1); Y[1] = th1 / th2 + th3 / sqrt(2 * th2) * randn(rng)
+    for k in 1:FINE
+        Y[k + 1] = th1 / th2 + decay * (Y[k] - th1 / th2) + sd * randn(rng)
+    end
+    return Y
+end
+
+function wiener_path(rng, tend)
+    W = zeros(FINE + 1)
+    W[2:end] .= cumsum(sqrt(tend / FINE) .* randn(rng, FINE))
+    return W
+end
+
+function poisson_path(rng, tend; rate = 5.0, jump = 0.5)
+    P = zeros(FINE + 1); t = randexp(rng) / rate
+    while t < tend
+        P[(ceil(Int, t * FINE / tend) + 1):end] .+= jump * rand(rng)
+        t += randexp(rng) / rate
+    end
+    return P
+end
+poisson_pair(rng, tend) = collect.(zip(poisson_path(rng, tend), poisson_path(rng, tend)))
+
+lerp(a::Number, b::Number, theta) = (1 - theta) * a + theta * b
+lerp(a, b, theta) = (lerp(a[1], b[1], theta), lerp(a[2], b[2], theta))
+
+function make_W(path, tend)
+    return function (t)
+        s = t * FINE / tend
+        i = clamp(floor(Int, s), 0, FINE - 1)
+        return lerp(path[i + 1], path[i + 2], s - i)
+    end
+end
+```
+
+None of the models has a closed-form solution. The reference is the classical fourth order
+Runge-Kutta method with one step per grid cell. The path is linear inside a cell, so the noise
+at the midpoint of the cell is the average of its two end values. To check the reference it is
+computed a second time with two steps per cell on the same path. The largest difference between
+the two is printed with every study below, and an error is reported only if it is more than 20
+times that difference.
+
+The reference is kept at $2^{14} + 1$ equally spaced times, which include the step times of
+every solve below. The error of a solve is the largest absolute difference to the reference
+over the saved steps and the components of the state. The strong error is the root mean square
+of that over 16 independent paths.
+
+```julia
+function reference(m, path, sub = 1)
+    n = FINE * sub; h = m.tend / n; every = n ÷ NSAVE
+    u = copy(m.u0); k1, k2, k3, k4, tmp = ntuple(_ -> similar(u), 5)
+    out = [copy(u)]
+    for j in 1:n
+        c = (j - 1) ÷ sub; s = (j - 1) % sub
+        wa = lerp(path[c + 1], path[c + 2], s / sub)
+        wb = lerp(path[c + 1], path[c + 2], (s + 1) / sub); wm = lerp(wa, wb, 0.5)
+        t = (j - 1) * h
+        m.f!(k1, u, m.p, t, wa)
+        @. tmp = u + h / 2 * k1
+        m.f!(k2, tmp, m.p, t + h / 2, wm)
+        @. tmp = u + h / 2 * k2
+        m.f!(k3, tmp, m.p, t + h / 2, wm)
+        @. tmp = u + h * k3
+        m.f!(k4, tmp, m.p, t + h, wb)
+        @. u += h / 6 * (k1 + 2 * k2 + 2 * k3 + k4)
+        j % every == 0 && push!(out, copy(u))
+    end
+    return out
+end
+
+gap(a, b) = maximum(maximum(abs, x .- y) for (x, y) in zip(a, b))
+
+function fitted_slope(ns, errs)
+    x = log2.(1 ./ ns); y = log2.(errs); n = length(x)
+    return (n * sum(x .* y) - sum(x) * sum(y)) / (n * sum(x .^ 2) - sum(x)^2)
+end
+
+model(name, f!, p, u0, tend, noise, taylor) = (; name, f!, p, u0, tend, noise, taylor,
+    grid = collect(range(0.0, tend; length = FINE + 1)))
+
+const ODE_ALGS = ["Euler" => Euler(), "Tsit5" => Tsit5(), "Vern9" => Vern9()]
+rode_algs(m) = vcat(["RandomEM" => RandomEM(), "RandomHeun" => RandomHeun()],
+    m.taylor ? ["RandomTaylor15" => RandomTaylor15()] : [])
+method_names(m) = vcat(first.(rode_algs(m)), first.(ODE_ALGS))
+
+function setups(m, path)
+    rode = RODEProblem{true}(m.f!, copy(m.u0), (0.0, m.tend), m.p,
+        noise = NoiseGrid(m.grid, path))
+    Wf = make_W(path, m.tend)
+    ode = ODEProblem{true}((du, u, p, t) -> m.f!(du, u, p, t, Wf(t)), copy(m.u0),
+        (0.0, m.tend), m.p)
+    return vcat([name => (rode, alg) for (name, alg) in rode_algs(m)],
+        [name => (ode, alg) for (name, alg) in ODE_ALGS])
+end
+
+run_fixed(prob, alg, dt) = solve(prob, alg, dt = dt, adaptive = false, save_everystep = true).u
+
+function strong_study(m)
+    rng = MersenneTwister(SEED)
+    E = Dict(name => zeros(PATHS, length(STEPS)) for name in method_names(m))
+    changes = zeros(PATHS); lo = Inf; hi = -Inf
+    for i in 1:PATHS
+        path = m.noise(rng, m.tend)
+        lo, hi = min(lo, minimum(minimum, path)), max(hi, maximum(maximum, path))
+        ref = reference(m, path)
+        changes[i] = gap(ref, reference(m, path, 2))
+        for (name, (prob, alg)) in setups(m, path), (j, n) in enumerate(STEPS)
+            E[name][i, j] = gap(run_fixed(prob, alg, m.tend / n), ref[1:(NSAVE ÷ n):end])
+        end
+    end
+    change = maximum(changes); limit = 20 * change
+    errs = Dict(name => sqrt.(vec(mean(E[name] .^ 2, dims = 1))) for name in method_names(m))
+    slopes = Dict(name => fitted_slope(STEPS[e .> limit], e[e .> limit])
+    for (name, e) in errs)
+    return (; errs, slopes, change, limit, lo, hi)
+end
+
+row(m, head, cells) = println(rpad(head, 7),
+    join(rpad.(cells, max.(10, length.(method_names(m)) .+ 1))))
+shown(e, limit) = e > limit ? @sprintf("%.3g", e) : "-"
+
+function print_strong(m, res)
+    names = method_names(m)
+    @printf("%s: %d paths, T = %g, initial state %s\n", m.name, PATHS, m.tend,
+        round.(m.u0, digits = 1))
+    @printf("noise between %.3g and %.3g\n", res.lo, res.hi)
+    @printf("two steps per cell change the reference by at most %.3g\n", res.change)
+    @printf("errors below %.3g are not reported\n\n", res.limit)
+    row(m, "n", names)
+    for (j, n) in enumerate(STEPS)
+        row(m, n, [shown(res.errs[name][j], res.limit) for name in names])
+    end
+    row(m, "slope", [@sprintf("%.2f", res.slopes[name]) for name in names])
+end
+
+function series!(plt, name, x, y)
+    ode = name in first.(ODE_ALGS)
+    return plot!(plt, x, y, label = name, linestyle = ode ? :dash : :solid,
+        marker = ode ? :square : name == "RandomTaylor15" ? :diamond : :circle)
+end
+
+function convergence_plot(m, res)
+    dts = m.tend ./ STEPS
+    plt = plot(xscale = :log10, yscale = :log10, xlabel = "dt", ylabel = "strong error",
+        title = m.name, legend = :outerright, size = (760, 420))
+    for name in method_names(m)
+        ok = res.errs[name] .> res.limit
+        series!(plt, name, dts[ok], res.errs[name][ok])
+    end
+    plot!(plt, dts, dts .* (res.errs["RandomEM"][end] / dts[end]),
+        linestyle = :dot, color = :black, label = "slope 1")
+    if m.taylor
+        ok = res.errs["RandomTaylor15"] .> res.limit; j = findlast(ok)
+        plot!(plt, dts[ok], dts[ok] .^ 2 .* (res.errs["RandomTaylor15"][j] / dts[j]^2),
+            linestyle = :dashdot, color = :black, label = "slope 2")
+    end
+    return plt
+end
+```
+
+## Population dynamics
+
+Section 15.2 of the book randomises a logistic growth model by an Ornstein-Uhlenbeck process
+$Y$ inside a cosine,
+
+$$\frac{dX}{dt} = r X (k - X) \cos(Y_t), \qquad
+dY_t = (\theta_1 - \theta_2 Y_t)\,dt + \theta_3\,dW_t,$$
+
+with $X(0) = 0.5$, $r = 5$, $k = 3$, $\theta_1 = 0$, $\theta_2 = 4$ and $\theta_3 = 0.1$. Two
+things are choices of this page: the end time $T = 1$, and the start of the noise, where $Y(0)$
+is drawn from the stationary distribution of the process.
+
+```julia
+function population!(du, u, p, t, Y)
+    du[1] = p.r * u[1] * (p.k - u[1]) * cos(Y)
+    return nothing
+end
+
+population = model("Population dynamics", population!, (r = 5.0, k = 3.0), [0.5], 1.0,
+    ou_path, true)
+population_res = strong_study(population)
+print_strong(population, population_res)
+```
+
+The printed range of the noise shows that $\cos(Y)$ stays within one percent of 1 on these
+paths, so the model is a small perturbation of the deterministic logistic equation. That is why
+`RandomHeun` reaches order 2 here, as it would without noise, and stays close to
+`RandomTaylor15` until the finest steps, and why `Tsit5` and `Vern9` start from far smaller
+errors than the RODE solvers. Their slopes are still close to 1, like those of `RandomEM` and
+`Euler`, which print the same errors.
+
+```julia
+convergence_plot(population, population_res)
+```
+
+## Toggle switch
+
+Section 15.3 takes two genes whose protein concentrations $x$ and $y$ activate themselves and
+repress each other,
+
+$$\frac{dx}{dt} = \left(\alpha_x(t) + \frac{x^4}{a^4 + x^4}\right)\frac{b^4}{b^4 + y^4}
+- \lambda_x x, \qquad
+\frac{dy}{dt} = \left(\alpha_y(t) + \frac{y^4}{c^4 + y^4}\right)\frac{d^4}{d^4 + x^4}
+- \lambda_y y,$$
+
+with thresholds $a = c = 0.25$ and $b = d = 0.4$, decay rates $\lambda_x = \lambda_y = 1.25$
+and $x(0) = y(0) = 10$. The external activations $\alpha_x$ and $\alpha_y$ are two independent
+compound Poisson processes that start at zero, with rate 5 and jump sizes uniform on
+$[0, 0.5]$. The end time $T = 4$ is a choice of this page. `RandomTaylor15` takes a scalar
+noise grid and the noise here has two components, so it is left out for this model.
+
+```julia
+function toggle!(du, u, p, t, alpha)
+    x4 = u[1]^4; y4 = u[2]^4
+    du[1] = (alpha[1] + x4 / (p.a^4 + x4)) * p.b^4 / (p.b^4 + y4) - p.lx * u[1]
+    du[2] = (alpha[2] + y4 / (p.c^4 + y4)) * p.d^4 / (p.d^4 + x4) - p.ly * u[2]
+    return nothing
+end
+
+toggle = model("Toggle switch", toggle!,
+    (a = 0.25, b = 0.4, c = 0.25, d = 0.4, lx = 1.25, ly = 1.25), [10.0, 10.0], 4.0,
+    poisson_pair, false)
+toggle_res = strong_study(toggle)
+print_strong(toggle, toggle_res)
+```
+
+Every method measures an order close to 1 on these paths with jumps. The classical orders 5 and
+9 do not show, and the methods differ in the constant only. `Vern9` has the smallest error at
+every step count, and `RandomHeun`, with two right-hand side evaluations per step, is below
+`Tsit5`, with six, at every step count.
+
+```julia
+convergence_plot(toggle, toggle_res)
+```
+
+## Tumor inhibition
+
+Section 15.1 uses a model of cancer cells $C$, promoters of their growth $P$ and inhibitors
+$I$. The constant input of inhibitor is replaced by a bounded function of a Wiener process $W$:
+
+$$\frac{dC}{dt} = \frac{rC}{\varepsilon C + 1}\,\frac{P}{I + 1} - \mu C, \qquad
+\frac{dP}{dt} = a_P C - b_P P, \qquad
+\frac{dI}{dt} = \zeta(W_t) + a_I C - b_I I,$$
+
+$$\zeta(w) = \zeta_0 \left(1 - \frac{2 \nu w}{1 + w^2}\right).$$
+
+The parameters are $r = 1$, $\mu = 0.1$, $a_P = 4.5$, $b_P = 0.11$, $a_I = 0.2$, $b_I = 0.01$,
+$\varepsilon = 0.34$, $\zeta_0 = 4$ and $\nu = 1$. The initial state is $C(0) = 35$ with
+$P(0) = a_P C(0) / b_P$ and $I(0) = (\zeta_0 + a_I C(0)) / b_I$, the values at which the last
+two equations are at rest for $\zeta = \zeta_0$. The end time $T = 20$ is a choice of this page.
+
+```julia
+function tumor!(du, u, p, t, W)
+    C, P, I = u
+    du[1] = p.r * C / (p.eps * C + 1) * P / (I + 1) - p.mu * C
+    du[2] = p.aP * C - p.bP * P
+    du[3] = p.zeta0 * (1 - 2 * p.nu * W / (1 + W^2)) + p.aI * C - p.bI * I
+    return nothing
+end
+
+tp = (r = 1.0, mu = 0.1, aP = 4.5, bP = 0.11, aI = 0.2, bI = 0.01, eps = 0.34, zeta0 = 4.0,
+    nu = 1.0)
+tumor = model("Tumor inhibition", tumor!, tp,
+    [35.0, tp.aP / tp.bP * 35.0, (tp.zeta0 + tp.aI * 35.0) / tp.bI], 20.0, wiener_path, true)
+tumor_res = strong_study(tumor)
+print_strong(tumor, tumor_res)
+```
+
+The errors are absolute, and the printed initial state shows the size of the components. The
+five methods that read the path only at points measure order 1, and `Tsit5` is above `Euler`
+at every step count. `RandomTaylor15` measures about 1.75, and from `n = 128` on its error is
+below that of every other method. Its slope is below 2 because the coarsest steps are not yet
+in the asymptotic range: the method differences the right-hand side in $W$ over a distance
+$\sqrt{dt}$, which is 0.8 at `n = 32`, and $\zeta$ varies on a scale of 1.
+
+```julia
+convergence_plot(tumor, tumor_res)
+```
+
+## Work-precision
+
+This section measures error against time for the first path of each model. Each problem is
+built once, outside the timer, and the time is the minimum over BenchmarkTools samples. With
+DiffEqNoiseProcess 5.36.4, which this folder pins, a solve shares the stored grid of a
+`NoiseGrid` and does not copy it, so the times of `RandomEM` and `RandomHeun` are the cost of
+stepping.
+
+`RandomTaylor15` computes its step integrals from every stored point of the path, so one solve
+reads all $2^{20}$ points once whatever the step count. That puts a floor under its time which
+is proportional to the length of the stored path. Its time at `n = 64`, where the stepping
+itself costs little, is close to that floor. The step counts here run to 16384, further than in
+the convergence studies, so that the order-1 methods get to spend as much time, and the line
+under each table says from which step count `RandomEM` takes longer than that.
+
+```julia
+function timed_study(m)
+    path = m.noise(MersenneTwister(SEED), m.tend)
+    ref = reference(m, path)
+    change = gap(ref, reference(m, path, 2))
+    errs = Dict(name => zeros(length(WP_STEPS)) for name in method_names(m))
+    times = Dict(name => zeros(length(WP_STEPS)) for name in method_names(m))
+    for (name, (prob, alg)) in setups(m, path), (j, n) in enumerate(WP_STEPS)
+        dt = m.tend / n
+        errs[name][j] = gap(run_fixed(prob, alg, dt), ref[1:(NSAVE ÷ n):end])
+        times[name][j] = @belapsed run_fixed($prob, $alg, $dt) seconds = 0.5 evals = 1
+    end
+    return (; errs, times, change, limit = 20 * change)
+end
+
+function print_timed(m, wp)
+    names = method_names(m)
+    @printf("%s, one path\n", m.name)
+    @printf("two steps per cell change the reference by %.3g\n", wp.change)
+    @printf("errors below %.3g are not reported\n\ntime in seconds\n", wp.limit)
+    row(m, "n", names)
+    for (j, n) in enumerate(WP_STEPS)
+        row(m, n, [@sprintf("%.3g", wp.times[name][j]) for name in names])
+    end
+    println("\nerror")
+    row(m, "n", names)
+    for (j, n) in enumerate(WP_STEPS)
+        row(m, n, [shown(wp.errs[name][j], wp.limit) for name in names])
+    end
+    if m.taylor
+        base = wp.times["RandomTaylor15"][1]; j = findfirst(>(base), wp.times["RandomEM"])
+        @printf("\nRandomTaylor15 at n=%d takes %.0f times as long as RandomEM at n=%d\n",
+            WP_STEPS[1], base / wp.times["RandomEM"][1], WP_STEPS[1])
+        println("RandomEM takes longer than that ",
+            j === nothing ? "at no step count run here" : "from n=$(WP_STEPS[j])")
+    end
+end
+
+function wp_plot(m, wp)
+    plt = plot(xscale = :log10, yscale = :log10, xlabel = "time (s)", ylabel = "error",
+        title = m.name * ", single path", legend = :outerright, size = (760, 420))
+    for name in method_names(m)
+        ok = wp.errs[name] .> wp.limit
+        series!(plt, name, wp.times[name][ok], wp.errs[name][ok])
+    end
+    return plt
+end
+
+population_wp = timed_study(population)
+print_timed(population, population_wp)
+```
+
+```julia
+wp_plot(population, population_wp)
+```
+
+```julia
+toggle_wp = timed_study(toggle)
+print_timed(toggle, toggle_wp)
+```
+
+```julia
+wp_plot(toggle, toggle_wp)
+```
+
+```julia
+tumor_wp = timed_study(tumor)
+print_timed(tumor, tumor_wp)
+```
+
+```julia
+wp_plot(tumor, tumor_wp)
+```
+
+On the population model the noise is too small for the path between the points to matter.
+`RandomHeun` has about the same error as `RandomTaylor15` in less time, and `Vern9` has the
+lowest error at every step count.
+
+On the toggle switch `Vern9` has the lowest error at every step count and the longest time, and
+`RandomHeun` is below `RandomEM` throughout.
+
+On the tumor model the floor is paid back. `RandomTaylor15` has the lowest error from `n = 256`
+on, and at the finest step count it takes about as long as `Vern9` for an error more than an
+order of magnitude smaller. For a coarse answer in less time than the floor, `Vern9` is the
+cheaper choice.
+
+## What this means for choosing a solver
+
+The three models cover three situations. Where the noise barely moves the right-hand side, as
+in the population model, a classical high-order method has the smallest error, `RandomHeun`
+reaches order 2, and reading the path inside the step buys nothing. Where the path jumps, as in
+the toggle switch, every method is order 1 and the constants decide. Where a Wiener path enters
+the right-hand side at full strength, as in the tumor model, the methods that read the path at
+points are held at order 1 and `RandomTaylor15` is not: past its time floor it gives the
+smallest error for the time spent.
+
+`Euler` on the interpolated path prints the same errors as `RandomEM` in every table.
+
+```julia, echo = false
+using SciMLBenchmarks
+SciMLBenchmarks.bench_footer(WEAVE_ARGS[:folder], WEAVE_ARGS[:file])
+```
