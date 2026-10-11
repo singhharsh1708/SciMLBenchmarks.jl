@@ -21,16 +21,16 @@ using StochasticDiffEq, DiffEqNoiseProcess, OrdinaryDiffEqLowOrderRK, OrdinaryDi
 gr()
 
 const SEED = 20261004
-const FINE = 2^20
+const FINE = 2^17
 const NSAVE = 2^14
 const STEPS = [32, 64, 128, 256, 512, 1024, 2048]
 const WP_STEPS = [64, 256, 1024, 4096, 16384]
-const PATHS = 16
+const PATHS = 256
 ```
 
 ## Noise paths and reference solution
 
-Each noise path is generated once on a grid of $2^{20}$ cells from the exact transition of its
+Each noise path is generated once on a grid of $2^{17}$ cells from the exact transition of its
 process, so the stored values are samples of the process itself: Gaussian increments for the
 Wiener process, the Gaussian transition of the Ornstein-Uhlenbeck process with the variance
 derived in Section 14.3 of the book, and exponential waiting times with uniform jump sizes for
@@ -89,7 +89,7 @@ times that difference.
 The reference is kept at $2^{14} + 1$ equally spaced times, which include the step times of
 every solve below. The error of a solve is the largest absolute difference to the reference
 over the saved steps and the components of the state. The strong error is the root mean square
-of that over 16 independent paths.
+of that over 256 independent paths.
 
 ```julia
 function reference(m, path, sub = 1)
@@ -332,7 +332,7 @@ DiffEqNoiseProcess 5.36.4, which this folder pins, a solve shares the stored gri
 stepping.
 
 `RandomTaylor15` computes its step integrals from every stored point of the path, so one solve
-reads all $2^{20}$ points once whatever the step count. That puts a floor under its time which
+reads all $2^{17}$ points once whatever the step count. That puts a floor under its time which
 is proportional to the length of the stored path. Its time at `n = 64`, where the stepping
 itself costs little, is close to that floor. The step counts here run to 16384, further than in
 the convergence studies, so that the order-1 methods get to spend as much time, and the line
@@ -413,14 +413,14 @@ wp_plot(tumor, tumor_wp)
 ```
 
 On the population model the noise is too small for the path between the points to matter.
-`RandomHeun` has about the same error as `RandomTaylor15` in less time, and `Vern9` has the
-lowest error at every step count.
+`RandomHeun` stays close to the error of `RandomTaylor15` until the finest step, in less time,
+and `Vern9` has the lowest error at every step count.
 
-On the toggle switch `Vern9` has the lowest error at every step count and the longest time, and
-`RandomHeun` is below `RandomEM` throughout.
+On the toggle switch no method is ahead at every step count on this one path. `RandomHeun` is
+below `RandomEM` throughout, and `Vern9` takes the longest.
 
 On the tumor model the floor is paid back. `RandomTaylor15` has the lowest error from `n = 256`
-on, and at the finest step count it takes about as long as `Vern9` for an error more than an
+on, and at the finest step count it takes less time than `Vern9` for an error more than an
 order of magnitude smaller. For a coarse answer in less time than the floor, `Vern9` is the
 cheaper choice.
 
